@@ -2,9 +2,10 @@ import os
 import time
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
 # --- HARDWARE CONFIGURATION ---
-TOTAL_CORES = 16
+TOTAL_CORES = multiprocessing.cpu_count()
 CORES_PER_UNIT = 4
 NUM_WORKERS = TOTAL_CORES // CORES_PER_UNIT  # = 4 Workers (Groups)
 
