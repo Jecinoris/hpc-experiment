@@ -1,222 +1,191 @@
 import os
 import time
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor
+from joblib import Parallel, delayed
 import multiprocessing
 
 # --- HARDWARE CONFIGURATION ---
 TOTAL_CORES = multiprocessing.cpu_count()
-CORES_PER_UNIT = 4
-NUM_WORKERS = TOTAL_CORES // CORES_PER_UNIT  # = 4 Workers (Groups)
 
-# --- CONFIGURATION ---
+# --- WORKLOAD CONFIGURATION ---
 N_MATRICES = 400000
 MATRIX_SIZE = 10
+
+# --- SWEEP CONFIGURATION ---
+# cores_per_unit values to benchmark:
+#   1              = batched, 1 thread per worker  (max process parallelism)
+#   intermediate   = hybrid (fewer workers x more threads each)
+#   TOTAL_CORES    = single worker using all threads (max thread parallelism)
+#
+# NOTE: All configurations use BATCHED dispatch (data split into num_workers
+# chunks, each processed with a single vectorized eigvals call).
+# This is NOT the same as true embarrassingly parallel, which would dispatch
+# each matrix individually (400k IPC round-trips — dominated by overhead
+# for tiny 10x10 matrices).
+CORES_PER_UNIT_SWEEP = [1, 2, 4, 8, 16, 32]
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+def set_thread_limits(n_threads):
+    """Set all BLAS/LAPACK thread environment variables."""
+    for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"]:
+        os.environ[var] = str(n_threads)
+
+
+# ============================================================================
+# WORKER FUNCTION
+# ============================================================================
+def computing_unit_task(batch_of_matrices, n_threads):
+    """
+    Process a batch of matrices inside a computing unit.
+    Sets thread limits inside the worker for robustness (in case the worker
+    process was reused from a previous run with different settings).
+    """
+    set_thread_limits(n_threads)
+    return np.linalg.eigvals(batch_of_matrices)
 
 
 # ============================================================================
 # METHOD 1: VANILLA (Implicit Parallel - Let NumPy use all cores)
 # ============================================================================
-def method1_vanilla():
+def run_vanilla(data):
     """
-    Vanilla approach: Let NumPy's underlying BLAS/LAPACK use all available cores.
-    This is the default behavior - no explicit parallelization control.
+    Vanilla approach: Single process, NumPy uses all available cores
+    internally via BLAS/LAPACK threading. No explicit parallelization.
     """
-    print("\n" + "="*70)
-    print("METHOD 1: VANILLA (Implicit Parallel - All Cores)")
-    print("="*70)
-    print("Strategy: Single process, NumPy uses all available cores internally")
-    print(f"Expected cores used: ~{TOTAL_CORES} (automatic)")
-    
-    # Generate data
-    print(f"\nGenerating {N_MATRICES} matrices ({MATRIX_SIZE}x{MATRIX_SIZE})...")
-    data = np.random.rand(N_MATRICES, MATRIX_SIZE, MATRIX_SIZE)
-    
-    # Process all at once
-    print("Processing all matrices in one call...")
+    set_thread_limits(TOTAL_CORES)
+
     start = time.time()
     results = np.linalg.eigvals(data)
-    end = time.time()
-    
-    elapsed = end - start
-    print(f"✓ Processed {len(results)} matrices")
-    print(f"⏱  Total Time: {elapsed:.4f} seconds")
-    print(f"📊 Throughput: {N_MATRICES/elapsed:.2f} matrices/second")
-    
+    elapsed = time.time() - start
+
     return elapsed
 
 
 # ============================================================================
-# METHOD 2: EMBARRASSINGLY PARALLEL (1 core per task, many tasks)
+# METHOD 2: BATCHED HYBRID SWEEP (parameterized by cores_per_unit)
 # ============================================================================
-def single_core_task(matrix):
+def run_hybrid(data, cores_per_unit):
     """
-    Process a single matrix using only 1 core.
-    This function runs in a worker process.
-    """
-    return np.linalg.eigvals(matrix)
+    Batched hybrid approach using joblib:
+      - num_workers = TOTAL_CORES // cores_per_unit  process-level parallelism
+      - cores_per_unit                               thread-level parallelism per worker
+      - Data is split into num_workers batches (vectorized eigvals per batch)
 
+    When cores_per_unit=1:  max workers, 1 thread each, but still BATCHED
+                            (NOT fine-grained embarrassingly parallel).
+    When cores_per_unit=TOTAL_CORES: single worker, all threads.
+    """
+    num_workers = TOTAL_CORES // cores_per_unit
 
-def method2_embarrassingly_parallel():
-    """
-    Embarrassingly parallel: Each worker gets 1 core and processes 1 matrix.
-    Maximum parallelism at the task level, no parallelism at the operation level.
-    """
-    print("\n" + "="*70)
-    print("METHOD 2: EMBARRASSINGLY PARALLEL (1 core per task)")
-    print("="*70)
-    print(f"Strategy: {TOTAL_CORES} workers, each with 1 core, processing individual matrices")
-    print(f"Expected cores used: {TOTAL_CORES}")
-    
-    # Set each worker to use only 1 thread
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    
-    # Generate data
-    print(f"\nGenerating {N_MATRICES} matrices ({MATRIX_SIZE}x{MATRIX_SIZE})...")
-    data = np.random.rand(N_MATRICES, MATRIX_SIZE, MATRIX_SIZE)
-    
-    print(f"Dispatching {N_MATRICES} tasks to {TOTAL_CORES} workers...")
+    # Set env vars in parent (inherited by freshly spawned loky workers)
+    set_thread_limits(cores_per_unit)
+
+    # Split data into equal batches — one per worker
+    batches = np.array_split(data, num_workers)
+
     start = time.time()
-    
-    # Use all cores as separate workers, each processing one matrix at a time
-    with ProcessPoolExecutor(max_workers=TOTAL_CORES) as executor:
-        results = list(executor.map(single_core_task, data))
-    
-    end = time.time()
-    
-    elapsed = end - start
-    print(f"✓ Processed {len(results)} matrices")
-    print(f"⏱  Total Time: {elapsed:.4f} seconds")
-    print(f"📊 Throughput: {N_MATRICES/elapsed:.2f} matrices/second")
-    
+
+    results = Parallel(n_jobs=num_workers)(
+        delayed(computing_unit_task)(batch, cores_per_unit)
+        for batch in batches
+    )
+
+    final = np.concatenate(results)
+    elapsed = time.time() - start
+
     return elapsed
 
 
 # ============================================================================
-# METHOD 3: HYBRID (Computing Units - 4 cores per unit)
-# ============================================================================
-def computing_unit_task(batch_of_matrices):
-    """
-    This function runs inside one of the 'Computing Units'.
-    Each unit uses 4 cores to process a batch of matrices.
-    """
-    return np.linalg.eigvals(batch_of_matrices)
-
-
-def method3_hybrid_computing_units():
-    """
-    Hybrid approach: Create 'computing units' of 4 cores each.
-    Process parallelism (4 units) + Thread parallelism (4 threads per unit).
-    """
-    print("\n" + "="*70)
-    print("METHOD 3: HYBRID (Computing Units - 4 cores per unit)")
-    print("="*70)
-    print(f"Strategy: {NUM_WORKERS} processes × {CORES_PER_UNIT} threads = {TOTAL_CORES} cores")
-    print(f"Expected cores used: {TOTAL_CORES}")
-    
-    # Configure each worker to use 4 threads
-    os.environ["OMP_NUM_THREADS"] = str(CORES_PER_UNIT)
-    os.environ["MKL_NUM_THREADS"] = str(CORES_PER_UNIT)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(CORES_PER_UNIT)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(CORES_PER_UNIT)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(CORES_PER_UNIT)
-    
-    # Generate data
-    print(f"\nGenerating {N_MATRICES} matrices ({MATRIX_SIZE}x{MATRIX_SIZE})...")
-    data = np.random.rand(N_MATRICES, MATRIX_SIZE, MATRIX_SIZE)
-    
-    # Split data into batches for computing units
-    batches = np.array_split(data, NUM_WORKERS)
-    print(f"Data split into {len(batches)} batches of ~{len(batches[0])} matrices each")
-    
-    print(f"Dispatching {NUM_WORKERS} batches to {NUM_WORKERS} computing units...")
-    start = time.time()
-    
-    # Use NUM_WORKERS processes, each using CORES_PER_UNIT threads
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        results = list(executor.map(computing_unit_task, batches))
-    
-    # Reassemble results
-    final_results = np.concatenate(results)
-    end = time.time()
-    
-    elapsed = end - start
-    print(f"✓ Processed {len(final_results)} matrices")
-    print(f"⏱  Total Time: {elapsed:.4f} seconds")
-    print(f"📊 Throughput: {N_MATRICES/elapsed:.2f} matrices/second")
-    
-    return elapsed
-
-
-# ============================================================================
-# MAIN COMPARISON
+# MAIN — RUN ALL CONFIGURATIONS
 # ============================================================================
 def main():
-    print("\n" + "="*70)
-    print("MATRIX EIGENVALUE COMPUTATION - PARALLELIZATION COMPARISON")
-    print("="*70)
-    print(f"Hardware: {TOTAL_CORES} cores")
-    print(f"Task: Computing eigenvalues for {N_MATRICES} matrices ({MATRIX_SIZE}×{MATRIX_SIZE})")
-    print("="*70)
-    
-    # Store results
+    print("\n" + "=" * 70)
+    print("MATRIX EIGENVALUE COMPUTATION — PARALLELIZATION SWEEP")
+    print("=" * 70)
+    print(f"Hardware:  {TOTAL_CORES} cores detected")
+    print(f"Workload:  {N_MATRICES:,} matrices ({MATRIX_SIZE}x{MATRIX_SIZE}) eigvals")
+    print(f"Sweep:     cores_per_unit = {CORES_PER_UNIT_SWEEP}")
+    print("=" * 70)
+
+    # Generate data once and reuse across all runs
+    print(f"\nGenerating {N_MATRICES:,} matrices ({MATRIX_SIZE}x{MATRIX_SIZE})...")
+    data = np.random.rand(N_MATRICES, MATRIX_SIZE, MATRIX_SIZE)
+
     results = {}
-    
-    # Run Method 1: Vanilla
-    time1 = method1_vanilla()
-    results['Vanilla (All Cores)'] = time1
-    
-    # Run Method 2: Embarrassingly Parallel
-    time2 = method2_embarrassingly_parallel()
-    results['Embarrassingly Parallel (1 core/task)'] = time2
-    
-    # Run Method 3: Hybrid Computing Units
-    time3 = method3_hybrid_computing_units()
-    results['Hybrid (4 cores/unit)'] = time3
-    
-    # Summary
-    print("\n" + "="*70)
-    print("SUMMARY - PERFORMANCE COMPARISON")
-    print("="*70)
-    
-    # Find fastest
+
+    # --- Vanilla baseline ---
+    print("\n" + "-" * 70)
+    print(f"[Vanilla] Single process, NumPy implicit threading (~{TOTAL_CORES} threads)")
+    print("-" * 70)
+    t = run_vanilla(data)
+    label = f"Vanilla ({TOTAL_CORES}T)"
+    results[label] = t
+    print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:,.0f} matrices/s")
+
+    # --- Sweep over cores_per_unit configurations ---
+    for cpu in CORES_PER_UNIT_SWEEP:
+        if TOTAL_CORES % cpu != 0:
+            print(f"\n  Skipping cores_per_unit={cpu} "
+                  f"(doesn't divide {TOTAL_CORES} evenly)")
+            continue
+
+        num_w = TOTAL_CORES // cpu
+        print("\n" + "-" * 70)
+        print(f"[Hybrid] {num_w} workers x {cpu} threads/worker = {num_w * cpu} cores")
+        print("-" * 70)
+
+        t = run_hybrid(data, cpu)
+        label = f"{num_w}W x {cpu}T"
+        results[label] = t
+        print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:,.0f} matrices/s")
+
+    # --- Summary table ---
+    print("\n" + "=" * 70)
+    print("SUMMARY — PERFORMANCE COMPARISON")
+    print("=" * 70)
+
     fastest = min(results, key=results.get)
     fastest_time = results[fastest]
-    
-    print(f"\n{'Method':<40} {'Time (s)':<12} {'Speedup':<10}")
+
+    print(f"\n{'Configuration':<30} {'Time (s)':>10} {'Throughput':>15} {'Relative':>10}")
     print("-" * 70)
-    
-    for method, elapsed in results.items():
-        speedup = fastest_time / elapsed
-        marker = " ⭐ FASTEST" if method == fastest else ""
-        print(f"{method:<40} {elapsed:>10.4f}   {speedup:>8.2f}x{marker}")
-    
-    print("\n" + "="*70)
-    print("ANALYSIS")
-    print("="*70)
-    print("""
-Method 1 (Vanilla): 
-  - Pros: Simple, no code complexity
-  - Cons: May have overhead with automatic thread management
-  - Best for: Quick prototyping, unknown workload characteristics
 
-Method 2 (Embarrassingly Parallel):
-  - Pros: Maximum task-level parallelism, good for small matrices
-  - Cons: No multi-threading per task, high process creation overhead
-  - Best for: Many small independent tasks, I/O bound operations
+    for label, elapsed in results.items():
+        throughput = N_MATRICES / elapsed
+        relative = fastest_time / elapsed
+        marker = " <-- best" if label == fastest else ""
+        print(f"{label:<30} {elapsed:>10.4f} {throughput:>12,.0f}/s "
+              f"{relative:>9.2f}x{marker}")
 
-Method 3 (Hybrid Computing Units):
-  - Pros: Balanced task + thread parallelism, efficient resource use
-  - Cons: More complex setup, requires tuning cores-per-unit
-  - Best for: Large batches of medium-sized compute tasks
-    """)
-    
-    print("="*70 + "\n")
+    print("\n" + "=" * 70)
+    print("NOTES")
+    print("=" * 70)
+    print(f"""
+  All hybrid configs use BATCHED dispatch: data is split into num_workers
+  chunks, each processed with one vectorized np.linalg.eigvals() call.
+
+  cores_per_unit=1  -> {TOTAL_CORES} workers x 1 thread, batched.
+                       Max process parallelism, no BLAS threading.
+
+  cores_per_unit=N  -> Fewer workers x N BLAS threads, batched.
+                       Lets BLAS exploit multi-threaded eigvals per batch.
+
+  Vanilla           -> Single process, NumPy auto-threads everything.
+                       Simplest code; good baseline.
+
+  This is NOT the same as true embarrassingly parallel (1 matrix per dispatch),
+  which would incur 400k IPC round-trips and be dominated by overhead for
+  small matrices.
+
+  The sweet spot depends on matrix size, BLAS implementation, and memory bandwidth.
+""")
+    print("=" * 70 + "\n")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
