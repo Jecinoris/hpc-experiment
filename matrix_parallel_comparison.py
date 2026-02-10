@@ -8,8 +8,8 @@ import multiprocessing
 TOTAL_CORES = multiprocessing.cpu_count()
 
 # --- WORKLOAD CONFIGURATION ---
-N_MATRICES = 400000
-MATRIX_SIZE = 10
+N_MATRICES = 32
+MATRIX_SIZE = 2500
 
 # --- SWEEP CONFIGURATION ---
 # cores_per_unit values to benchmark:
@@ -19,10 +19,7 @@ MATRIX_SIZE = 10
 #
 # NOTE: All configurations use BATCHED dispatch (data split into num_workers
 # chunks, each processed with a single vectorized eigvals call).
-# This is NOT the same as true embarrassingly parallel, which would dispatch
-# each matrix individually (400k IPC round-trips — dominated by overhead
-# for tiny 10x10 matrices).
-CORES_PER_UNIT_SWEEP = [1, 2, 4, 8, 16, 32]
+CORES_PER_UNIT_SWEEP = [1, 2, 4, 8, 16]
 
 
 # ============================================================================
@@ -38,20 +35,24 @@ def set_thread_limits(n_threads):
 # ============================================================================
 # WORKER FUNCTION
 # ============================================================================
-def computing_unit_task(batch_of_matrices, n_threads):
+def computing_unit_task(seeds, n_threads):
     """
     Process a batch of matrices inside a computing unit.
-    Sets thread limits inside the worker for robustness (in case the worker
-    process was reused from a previous run with different settings).
+    Generates matrices from seeds to avoid shipping huge arrays over IPC.
     """
     set_thread_limits(n_threads)
-    return np.linalg.eigvals(batch_of_matrices)
+    results = []
+    for seed in seeds:
+        np.random.seed(seed)
+        A = np.random.rand(MATRIX_SIZE, MATRIX_SIZE)
+        results.append(np.linalg.eigvals(A))
+    return results
 
 
 # ============================================================================
 # METHOD 1: VANILLA (Implicit Parallel - Let NumPy use all cores)
 # ============================================================================
-def run_vanilla(data):
+def run_vanilla():
     """
     Vanilla approach: Single process, NumPy uses all available cores
     internally via BLAS/LAPACK threading. No explicit parallelization.
@@ -59,7 +60,11 @@ def run_vanilla(data):
     set_thread_limits(TOTAL_CORES)
 
     start = time.time()
-    results = np.linalg.eigvals(data)
+    results = []
+    for i in range(N_MATRICES):
+        np.random.seed(i)
+        A = np.random.rand(MATRIX_SIZE, MATRIX_SIZE)
+        results.append(np.linalg.eigvals(A))
     elapsed = time.time() - start
 
     return elapsed
@@ -68,15 +73,14 @@ def run_vanilla(data):
 # ============================================================================
 # METHOD 2: BATCHED HYBRID SWEEP (parameterized by cores_per_unit)
 # ============================================================================
-def run_hybrid(data, cores_per_unit):
+def run_hybrid(cores_per_unit):
     """
     Batched hybrid approach using joblib:
       - num_workers = TOTAL_CORES // cores_per_unit  process-level parallelism
       - cores_per_unit                               thread-level parallelism per worker
-      - Data is split into num_workers batches (vectorized eigvals per batch)
+      - Data is split into num_workers batches (each worker processes its batch)
 
-    When cores_per_unit=1:  max workers, 1 thread each, but still BATCHED
-                            (NOT fine-grained embarrassingly parallel).
+    When cores_per_unit=1:  max workers, 1 thread each, batched.
     When cores_per_unit=TOTAL_CORES: single worker, all threads.
     """
     num_workers = TOTAL_CORES // cores_per_unit
@@ -84,8 +88,9 @@ def run_hybrid(data, cores_per_unit):
     # Set env vars in parent (inherited by freshly spawned loky workers)
     set_thread_limits(cores_per_unit)
 
-    # Split data into equal batches — one per worker
-    batches = np.array_split(data, num_workers)
+    # Split seeds into batches — one per worker
+    all_seeds = list(range(N_MATRICES))
+    batches = [all_seeds[i::num_workers] for i in range(num_workers)]
 
     start = time.time()
 
@@ -94,7 +99,6 @@ def run_hybrid(data, cores_per_unit):
         for batch in batches
     )
 
-    final = np.concatenate(results)
     elapsed = time.time() - start
 
     return elapsed
@@ -108,24 +112,20 @@ def main():
     print("MATRIX EIGENVALUE COMPUTATION — PARALLELIZATION SWEEP")
     print("=" * 70)
     print(f"Hardware:  {TOTAL_CORES} cores detected")
-    print(f"Workload:  {N_MATRICES:,} matrices ({MATRIX_SIZE}x{MATRIX_SIZE}) eigvals")
+    print(f"Workload:  {N_MATRICES} x eigvals({MATRIX_SIZE}x{MATRIX_SIZE} float64)")
     print(f"Sweep:     cores_per_unit = {CORES_PER_UNIT_SWEEP}")
     print("=" * 70)
-
-    # Generate data once and reuse across all runs
-    print(f"\nGenerating {N_MATRICES:,} matrices ({MATRIX_SIZE}x{MATRIX_SIZE})...")
-    data = np.random.rand(N_MATRICES, MATRIX_SIZE, MATRIX_SIZE)
 
     results = {}
 
     # --- Vanilla baseline ---
     print("\n" + "-" * 70)
-    print(f"[Vanilla] Single process, NumPy implicit threading (~{TOTAL_CORES} threads)")
+    print(f"[Vanilla] Sequential eigvals, {TOTAL_CORES} BLAS threads each")
     print("-" * 70)
-    t = run_vanilla(data)
-    label = f"Vanilla ({TOTAL_CORES}T)"
+    t = run_vanilla()
+    label = f"Vanilla (seq, {TOTAL_CORES}T)"
     results[label] = t
-    print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:,.0f} matrices/s")
+    print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:.2f} matrices/s")
 
     # --- Sweep over cores_per_unit configurations ---
     for cpu in CORES_PER_UNIT_SWEEP:
@@ -136,13 +136,14 @@ def main():
 
         num_w = TOTAL_CORES // cpu
         print("\n" + "-" * 70)
-        print(f"[Hybrid] {num_w} workers x {cpu} threads/worker = {num_w * cpu} cores")
+        print(f"[Hybrid] {num_w} workers x {cpu} threads/worker "
+              f"= {num_w * cpu} cores")
         print("-" * 70)
 
-        t = run_hybrid(data, cpu)
+        t = run_hybrid(cpu)
         label = f"{num_w}W x {cpu}T"
         results[label] = t
-        print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:,.0f} matrices/s")
+        print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:.2f} matrices/s")
 
     # --- Summary table ---
     print("\n" + "=" * 70)
@@ -159,30 +160,28 @@ def main():
         throughput = N_MATRICES / elapsed
         relative = fastest_time / elapsed
         marker = " <-- best" if label == fastest else ""
-        print(f"{label:<30} {elapsed:>10.4f} {throughput:>12,.0f}/s "
+        print(f"{label:<30} {elapsed:>10.4f} {throughput:>11.2f}/s "
               f"{relative:>9.2f}x{marker}")
 
     print("\n" + "=" * 70)
     print("NOTES")
     print("=" * 70)
     print(f"""
-  All hybrid configs use BATCHED dispatch: data is split into num_workers
-  chunks, each processed with one vectorized np.linalg.eigvals() call.
+  Each worker receives a batch of seeds, generates matrices locally,
+  and computes eigvals one at a time with its assigned BLAS thread count.
+  This avoids shipping large matrices over IPC.
 
   cores_per_unit=1  -> {TOTAL_CORES} workers x 1 thread, batched.
-                       Max process parallelism, no BLAS threading.
+                       Max process parallelism, no BLAS threading per eigvals.
 
-  cores_per_unit=N  -> Fewer workers x N BLAS threads, batched.
-                       Lets BLAS exploit multi-threaded eigvals per batch.
+  cores_per_unit=N  -> {TOTAL_CORES}//N workers x N BLAS threads, batched.
+                       Fewer concurrent tasks, but each eigvals is BLAS-accelerated.
 
-  Vanilla           -> Single process, NumPy auto-threads everything.
-                       Simplest code; good baseline.
+  Vanilla           -> Sequential: 1 eigvals at a time, all {TOTAL_CORES} BLAS threads.
+                       No task parallelism at all.
 
-  This is NOT the same as true embarrassingly parallel (1 matrix per dispatch),
-  which would incur 400k IPC round-trips and be dominated by overhead for
-  small matrices.
-
-  The sweet spot depends on matrix size, BLAS implementation, and memory bandwidth.
+  The sweet spot depends on how well BLAS scales eigvals({MATRIX_SIZE}x{MATRIX_SIZE})
+  across threads vs. how many independent eigvals can run concurrently.
 """)
     print("=" * 70 + "\n")
 
