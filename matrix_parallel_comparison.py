@@ -19,7 +19,7 @@ MATRIX_SIZE = 2500
 #
 # NOTE: All configurations use BATCHED dispatch (data split into num_workers
 # chunks, each processed with a single vectorized eigvals call).
-CORES_PER_UNIT_SWEEP = [1, 2, 4, 8, 16]
+CORES_PER_UNIT_SWEEP = [1, 4, 8, 16]
 
 
 # ============================================================================
@@ -119,13 +119,13 @@ def main():
     results = {}
 
     # --- Vanilla baseline ---
-    print("\n" + "-" * 70)
-    print(f"[Vanilla] Sequential eigvals, {TOTAL_CORES} BLAS threads each")
-    print("-" * 70)
-    t = run_vanilla()
-    label = f"Vanilla (seq, {TOTAL_CORES}T)"
-    results[label] = t
-    print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:.2f} matrices/s")
+    # print("\n" + "-" * 70)
+    # print(f"[Vanilla] Sequential eigvals, {TOTAL_CORES} BLAS threads each")
+    # print("-" * 70)
+    # t = run_vanilla()
+    # label = f"Vanilla (seq, {TOTAL_CORES}T)"
+    # results[label] = t
+    # print(f"  Time: {t:.4f}s  |  Throughput: {N_MATRICES/t:.2f} matrices/s")
 
     # --- Sweep over cores_per_unit configurations ---
     for cpu in CORES_PER_UNIT_SWEEP:

@@ -34,7 +34,7 @@ if __name__ == "__main__":
     # 32:  Slight oversaturation (common sweet spot)
     # 48:  Heavy traffic
     # 64:  Traffic jam
-    core_counts = [4, 8, 16, 32]
+    core_counts = [1, 4, 8, 16, 32]
     
     for n_workers in core_counts:
         print(f"Testing with {n_workers} Active Cores...", end="", flush=True)
